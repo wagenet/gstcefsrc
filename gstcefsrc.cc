@@ -53,6 +53,11 @@ GST_DEBUG_CATEGORY_STATIC (cef_console_debug);
  * retains width * height * 4 bytes. In steady state create() pops one frame
  * per paint; two lets a new frame land while one is in flight. */
 #define MAX_QUEUED_FRAMES 2
+
+/* Bound for the audio packet list, drained by the same create() call. It is
+ * emptied on every video frame and normally holds a handful of packets, so
+ * this only trips once create() has stopped. */
+#define MAX_QUEUED_AUDIO_BUFFERS 128
 #define DEFAULT_URL "https://www.google.com"
 #define DEFAULT_GPU FALSE
 #define DEFAULT_CHROMIUM_DEBUG_PORT -1
@@ -399,6 +404,14 @@ class AudioHandler : public CefAudioHandler
 
     if (!src->audio_buffers) {
       src->audio_buffers = gst_buffer_list_new();
+    }
+
+    /* Nothing drains this once create() has stopped; drop the oldest packets. */
+    guint n_audio = gst_buffer_list_length (src->audio_buffers);
+    if (n_audio >= MAX_QUEUED_AUDIO_BUFFERS) {
+      guint drop = n_audio - MAX_QUEUED_AUDIO_BUFFERS + 1;
+      GST_DEBUG_OBJECT (src, "audio queue full, dropping %u stale buffers", drop);
+      gst_buffer_list_remove (src->audio_buffers, 0, drop);
     }
 
     gst_buffer_list_add (src->audio_buffers, buf);
