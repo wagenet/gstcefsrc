@@ -1479,7 +1479,7 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
   g_object_class_install_property (gobject_class, PROP_URL,
       g_param_spec_string ("url", "url",
           "The URL to display",
-          DEFAULT_URL, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT)));
+          DEFAULT_URL, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT | GST_PARAM_MUTABLE_PLAYING)));
 
   g_object_class_install_property (gobject_class, PROP_GPU,
     g_param_spec_boolean ("gpu", "gpu",
