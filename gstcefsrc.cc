@@ -55,6 +55,7 @@ GST_DEBUG_CATEGORY_STATIC (cef_console_debug);
 #define DEFAULT_SANDBOX FALSE
 #endif
 #define DEFAULT_LISTEN_FOR_JS_SIGNALS FALSE
+#define DEFAULT_REPEAT_IDLE_FRAMES FALSE
 
 using CefStatus = enum : guint8 {
   // CEF was either unloaded successfully or not yet loaded.
@@ -132,6 +133,7 @@ enum
   PROP_LOG_SEVERITY,
   PROP_CEF_CACHE_LOCATION,
   PROP_MAX_VIDEO_FRAMERATE,
+  PROP_REPEAT_IDLE_FRAMES,
 };
 
 #define gst_cef_src_parent_class parent_class
@@ -265,12 +267,15 @@ class RenderHandler : public CefRenderHandler
       new_buffer = gst_buffer_new_allocate (NULL, src->width * src->height * 4, NULL);
       gst_buffer_fill (new_buffer, 0, buffer, w * h * 4);
 
-      // running time
+      g_mutex_lock (&src->queue_lock);
+
+      // running time, sampled under queue_lock so that create() never
+      // stamps a repeated frame later than a paint that is about to be queued
       GstClockTime gst_pts = gst_element_get_current_running_time (GST_ELEMENT (src));
 
       GST_BUFFER_PTS (new_buffer) = gst_pts;
+      GST_LOG_OBJECT (src, "frame pts %" GST_TIME_FORMAT, GST_TIME_ARGS (gst_pts));
 
-      g_mutex_lock (&src->queue_lock);
       gst_queue_array_push_tail (src->queue, new_buffer);
       GST_LOG_OBJECT (src, "frame buffer queue len: %u", gst_queue_array_get_length(src->queue));
       g_cond_signal (&src->queue_cond);
@@ -732,6 +737,12 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
 {
   GstCefSrc *src = GST_CEF_SRC (push_src);
   GList *tmp;
+  GstClockTime frame_duration = GST_CLOCK_TIME_NONE;
+  GstClockTime now = GST_CLOCK_TIME_NONE;
+  gboolean repeat = FALSE;
+
+  if (src->repeat_idle_frames && src->fps_n > 0)
+    frame_duration = gst_util_uint64_scale_int (GST_SECOND, src->fps_d, src->fps_n);
 
   g_mutex_lock (&src->queue_lock);
 
@@ -747,7 +758,28 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
   while (gst_queue_array_is_empty(src->queue) &&
          !src->flushing &&
          (!src->audio_buffers || !src->downstream_demuxer)) {
-    g_cond_wait(&src->queue_cond, &src->queue_lock);
+    if (!src->last_frame || !GST_CLOCK_TIME_IS_VALID (frame_duration)) {
+      g_cond_wait(&src->queue_cond, &src->queue_lock);
+      continue;
+    }
+
+    // Wait for a paint until one frame interval after the last buffer, then
+    // repeat that frame. Chromium only paints when the page changes.
+    GstClockTime deadline = src->last_pts + frame_duration;
+
+    now = gst_element_get_current_running_time (GST_ELEMENT (src));
+    if (!GST_CLOCK_TIME_IS_VALID (now)) {
+      g_cond_wait(&src->queue_cond, &src->queue_lock);
+      continue;
+    }
+
+    if (now >= deadline) {
+      repeat = TRUE;
+      break;
+    }
+
+    g_cond_wait_until (&src->queue_cond, &src->queue_lock,
+        g_get_monotonic_time () + (gint64) ((deadline - now + GST_USECOND - 1) / GST_USECOND));
   }
 
   if (src->flushing) {
@@ -758,6 +790,18 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
 
   if (!gst_queue_array_is_empty (src->queue)) {
     *buf = (GstBuffer *)gst_queue_array_pop_head (src->queue);
+    GST_BUFFER_DURATION (*buf) = frame_duration;
+  } else if (repeat) {
+    // A repeat is a shallow copy of the last frame and shares its GstMemory.
+    // Consumers rely on that to tell repeats apart from new paints.
+    *buf = gst_buffer_copy (src->last_frame);
+    // Stamp it on the frame grid of the last buffer, at the latest slot that
+    // has already begun, so a late wakeup does not produce a burst of repeats.
+    GST_BUFFER_PTS (*buf) = src->last_pts +
+        (now - src->last_pts) / frame_duration * frame_duration;
+    GST_BUFFER_DURATION (*buf) = frame_duration;
+    GST_LOG_OBJECT (src, "repeating last frame at %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (GST_BUFFER_PTS (*buf)));
   } else if (src->downstream_demuxer) {
     *buf = gst_buffer_new ();
   } else {
@@ -773,6 +817,18 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
   }
 
   g_mutex_unlock (&src->queue_lock);
+
+  if (GST_CLOCK_TIME_IS_VALID (frame_duration) && gst_buffer_get_size (*buf) > 0) {
+    if (!GST_BUFFER_PTS_IS_VALID (*buf)) {
+      gst_buffer_replace (&src->last_frame, NULL);
+    } else {
+      if (!repeat) {
+        // The audio meta has no transform function, so the copy leaves it out.
+        gst_buffer_take (&src->last_frame, gst_buffer_copy (*buf));
+      }
+      src->last_pts = GST_BUFFER_PTS (*buf);
+    }
+  }
 
   return GST_FLOW_OK;
 }
@@ -1103,6 +1159,8 @@ gst_cef_src_stop (GstBaseSrc *base_src)
   g_cond_signal(&src->queue_cond);
   g_mutex_unlock(&src->queue_lock);
 
+  gst_buffer_replace (&src->last_frame, NULL);
+
   return TRUE;
 }
 
@@ -1184,6 +1242,8 @@ gst_cef_src_set_caps (GstBaseSrc * base_src, GstCaps * caps)
   src->browser->GetHost()->SetWindowlessFrameRate(gst_util_uint64_scale (1, src->fps_n, src->fps_d));
   src->browser->GetHost()->WasResized();
   g_mutex_unlock (&src->queue_lock);
+
+  gst_buffer_replace (&src->last_frame, NULL);
 
   return ret;
 }
@@ -1292,6 +1352,9 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
       src->fps_n = gst_value_get_fraction_numerator (value);
       src->fps_d = gst_value_get_fraction_denominator (value);
       break;
+    case PROP_REPEAT_IDLE_FRAMES:
+      src->repeat_idle_frames = g_value_get_boolean (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -1335,6 +1398,9 @@ gst_cef_src_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_MAX_VIDEO_FRAMERATE:
       gst_value_set_fraction (value, src->fps_n, src->fps_d);
       break;
+    case PROP_REPEAT_IDLE_FRAMES:
+      g_value_set_boolean (value, src->repeat_idle_frames);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -1361,6 +1427,7 @@ gst_cef_src_finalize (GObject *object)
   g_mutex_clear(&src->state_lock);
 
   gst_queue_array_free (src->queue);
+  gst_buffer_replace (&src->last_frame, NULL);
   g_mutex_clear(&src->queue_lock);
   g_cond_clear(&src->queue_cond);
 }
@@ -1381,6 +1448,9 @@ gst_cef_src_init (GstCefSrc * src)
   src->cef_cache_location = NULL;
   src->fps_n = DEFAULT_FPS_N;
   src->fps_d = DEFAULT_FPS_D;
+  src->repeat_idle_frames = DEFAULT_REPEAT_IDLE_FRAMES;
+  src->last_frame = NULL;
+  src->last_pts = GST_CLOCK_TIME_NONE;
 
   gst_base_src_set_format (base_src, GST_FORMAT_TIME);
   gst_base_src_set_live (base_src, TRUE);
@@ -1469,6 +1539,13 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
           "Max video framerate to select",
           0, 1, G_MAXINT, 1, DEFAULT_FPS_N, DEFAULT_FPS_D,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
+
+  g_object_class_install_property (gobject_class, PROP_REPEAT_IDLE_FRAMES,
+    g_param_spec_boolean ("repeat-idle-frames", "Repeat idle frames",
+          "Repeat the last frame when the page has not painted for one frame "
+          "interval at max-video-framerate, so that output continues while the "
+          "page is idle. Repeated buffers share memory with the original frame",
+          DEFAULT_REPEAT_IDLE_FRAMES, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
 
   gst_element_class_set_static_metadata (gstelement_class,
       "Chromium Embedded Framework source", "Source/Video",

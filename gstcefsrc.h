@@ -73,6 +73,10 @@ struct _GstCefSrc {
   GstQueueArray *queue; //TODO deprecated, revert when Ubuntu LTS uses 1.26
   gboolean flushing;
   gboolean downstream_demuxer;
+
+  gboolean repeat_idle_frames;
+  GstBuffer *last_frame; //streaming thread only
+  GstClockTime last_pts; //streaming thread only
 };
 
 struct _GstCefSrcClass {
